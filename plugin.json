@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/system/plugin-schema.json",
+  "name": "steam-timefreeze",
+  "common_name": "Timefreeze",
+  "description": "Freeze any Steam game at its current version from its Properties dialog so Steam will not update it or force an update on launch.",
+  "version": "0.1.0",
+  "useBackend": true,
+  "backendType": "lua"
+}
