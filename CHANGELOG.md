@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.6-beta] - 2026-11-24
+
+### Fixed
+
+- **Immediate Backend Startup Guard**: Added `enforce_frozen_on_startup()` in `backend/main.lua` (`on_load`) so frozen games have `downloading/<appid>`, `temp/<appid>`, and `.patch` caches purged and any dirty/writable `appmanifest` (`StateFlags != 4`, `TargetBuildID != 0`, `BytesToDownload > 0`, `StagedDepots`, or cleared read-only) repaired immediately at Steam boot, before Steam's download manager finishes scanning `steamapps`.
+- **Strip `StagedDepots` from Manifests**: Updated `vdf.patch_manifest` to remove leftover `StagedDepots` blocks when freezing, preventing Steam from reviving staged updates on restart for multi-depot games.
+- **Pre-Restart Purge & Cancel Settle**: `Timefreeze` now waits 250ms after `PauseAppUpdate` / `RemoveFromDownloadList` / `app_update_cancel` before purging and locking, and **Restart Steam** re-purges/re-locks right before calling `StartRestart`, eliminating the "needs two restarts" race.
+- **Reliable Depot Resolution**: `fetchSteamAppInfo` now waits for `app_info_print` console spew to settle (instead of a fixed 900ms cutoff) and falls back to the SteamCMD Web API if `SteamClient.Console` returns branches without public depot manifest GIDs.
+- **Per-Depot Patch Cleanup**: `purge_download_cache` now also scans `steamapps/downloading` for per-depot `state_<appid>_*.patch` and `<appid>_*.patch` files.
+
+### Added
+
+- **Detailed Freeze & Sync Diagnostics**: `timefreeze.log` now records exact `sync_frozen` trigger reasons (`not_ro`, `build_mismatch`, `depot_mismatch`), `freeze` depot match counts (`depots=X/Y`, `unmatched=[...]`, `staged_cleared`), `displayStatus` transitions, and `[timefreeze] startup-guard` results.
+
 ## [0.1.5-beta] - 2026-11-24
 
 ### Added

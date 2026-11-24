@@ -130,6 +130,7 @@ export function TimefreezePage({ appid }: { appid: number }) {
         setBusy(true);
         setError("");
         setMessage("Applying Timefreeze...");
+        const beforeDisplay = liveDisplayStatus(appid);
         try {
             const sc = steamClient();
             try {
@@ -140,15 +141,19 @@ export function TimefreezePage({ appid }: { appid: number }) {
             } catch {
                 /* non-fatal if SteamClient methods differ */
             }
+            // Give Steam's download manager a moment to release file handles before purging cache
+            await new Promise((r) => setTimeout(r, 250));
 
             const res = await backend.freeze(appid, latestBuildId, latestDepots);
-            setDisplayStatus(liveDisplayStatus(appid));
+            const afterDisplay = liveDisplayStatus(appid);
+            setDisplayStatus(afterDisplay);
+            logger.info(`freeze UI appid=${appid} displayStatus=${beforeDisplay}->${afterDisplay} target=${latestBuildId} depotCount=${Object.keys(latestDepots).length}`);
             if (res.error) {
                 setError(res.error);
                 setMessage("");
             } else {
                 setStatus(res);
-                const needsRestart = liveDisplayStatus(appid) === 20;
+                const needsRestart = afterDisplay === 20;
                 setMessage(
                     needsRestart
                         ? `Frozen at Build ${res.installedBuildId}. Steam already cached this update in memory — click Restart Steam to switch the button to Play.`
@@ -212,11 +217,31 @@ export function TimefreezePage({ appid }: { appid: number }) {
         }
     };
 
-    const handleRestartSteam = () => {
+    const handleRestartSteam = async () => {
         const sc = steamClient();
+        setBusy(true);
+        setMessage("Purging update cache & restarting Steam...");
+        try {
+            try {
+                sc?.Downloads?.PauseAppUpdate?.(appid);
+                sc?.Downloads?.RemoveFromDownloadList?.(appid);
+                sc?.Console?.ExecCommand?.(`app_update_cancel ${appid}`);
+            } catch {
+                /* ignore */
+            }
+            await new Promise((r) => setTimeout(r, 150));
+            if (status?.frozen) {
+                await backend.freeze(appid, latestBuildId, latestDepots);
+            } else {
+                await backend.purgeCache(appid);
+            }
+        } catch (err) {
+            logger.warn(`Pre-restart purge failed for appid=${appid}:`, err);
+        }
         if (sc?.User?.StartRestart) {
             sc.User.StartRestart(false);
         } else {
+            setBusy(false);
             setMessage("Please restart Steam manually from Steam → Exit to reload the frozen manifest.");
         }
     };

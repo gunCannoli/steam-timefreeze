@@ -248,13 +248,14 @@ async function queryConsole(appid: number, timeoutMs: number): Promise<ParsedApp
     return new Promise<ParsedAppInfo>((resolve) => {
         const chunks: string[] = [];
         let settled = false;
-        const sub = consoleApi.RegisterForSpewOutput!((ev) => {
-            if (ev && typeof ev.spew === "string") chunks.push(ev.spew);
-        });
+        let settleTimer: ReturnType<typeof setTimeout> | null = null;
+        let maxTimer: ReturnType<typeof setTimeout> | null = null;
 
         const finish = () => {
             if (settled) return;
             settled = true;
+            if (settleTimer) clearTimeout(settleTimer);
+            if (maxTimer) clearTimeout(maxTimer);
             try {
                 sub?.unregister?.();
             } catch {
@@ -263,6 +264,14 @@ async function queryConsole(appid: number, timeoutMs: number): Promise<ParsedApp
             resolve(parseAppInfoText(appid, chunks.join("")));
         };
 
+        const sub = consoleApi.RegisterForSpewOutput!((ev) => {
+            if (ev && typeof ev.spew === "string") {
+                chunks.push(ev.spew);
+                if (settleTimer) clearTimeout(settleTimer);
+                settleTimer = setTimeout(finish, 250);
+            }
+        });
+
         try {
             consoleApi.ExecCommand!(`app_info_print ${appid}`);
         } catch {
@@ -270,7 +279,7 @@ async function queryConsole(appid: number, timeoutMs: number): Promise<ParsedApp
             return;
         }
 
-        setTimeout(finish, timeoutMs);
+        maxTimer = setTimeout(finish, Math.max(timeoutMs, 2000));
     });
 }
 
@@ -311,20 +320,29 @@ export function fetchSteamAppInfo(appid: number, timeoutMs = 900): Promise<Parse
     const task = async (): Promise<ParsedAppInfo> => {
         // 1. Try SteamClient console first
         const fromConsole = await queryConsole(appid, timeoutMs);
-        if (fromConsole && fromConsole.branches.length > 0) {
+        const consolePublicDepots = Object.keys(fromConsole?.branchDepots?.["public"] ?? {}).length;
+        if (fromConsole && fromConsole.branches.length > 0 && consolePublicDepots > 0) {
             cache.set(appid, { info: fromConsole, expires: Date.now() + 3600000 });
-            logger.info(`Resolved appInfo for appid=${appid} via SteamClient.Console (${fromConsole.branches.length} branch(es))`);
+            logger.info(`Resolved appInfo for appid=${appid} via SteamClient.Console (${fromConsole.branches.length} branch(es), ${consolePublicDepots} public depot(s))`);
             return fromConsole;
         }
 
-        // 2. Try Web API fallback
+        // 2. Try Web API fallback (also used if console returned branches without depot GIDs)
         const fromWeb = await queryWebFallback(appid);
         if (fromWeb && fromWeb.branches.length > 0) {
             cache.set(appid, { info: fromWeb, expires: Date.now() + 3600000 });
-            logger.info(`Resolved appInfo for appid=${appid} via SteamCMD Web API fallback (${fromWeb.branches.length} branch(es))`);
+            const webPublicDepots = Object.keys(fromWeb.branchDepots["public"] ?? {}).length;
+            logger.info(`Resolved appInfo for appid=${appid} via SteamCMD Web API fallback (${fromWeb.branches.length} branch(es), ${webPublicDepots} public depot(s))`);
             return fromWeb;
         }
 
+        if (fromConsole && fromConsole.branches.length > 0) {
+            cache.set(appid, { info: fromConsole, expires: Date.now() + 3600000 });
+            logger.warn(`Resolved appInfo for appid=${appid} via SteamClient.Console with 0 public depots (${fromConsole.branches.length} branch(es))`);
+            return fromConsole;
+        }
+
+        logger.warn(`Failed to resolve appInfo for appid=${appid} from both Console and Web API`);
         return { appid, branches: [], branchDepots: {} };
     };
 

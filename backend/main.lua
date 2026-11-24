@@ -4,6 +4,7 @@ local millennium = require("millennium")
 local logger = require("logger")
 local platform = require("platform")
 local log = require("log")
+local timefreeze = require("timefreeze")
 local RPC = require("rpc")
 
 TimefreezeGetStatus = RPC.TimefreezeGetStatus
@@ -18,6 +19,10 @@ TimefreezeLog = RPC.TimefreezeLog
 local function on_load()
   log.install()
   logger:info(string.format("[startup] steam-timefreeze loaded (os=%s)", platform.os_name()))
+  local ok_guard, err_guard = pcall(timefreeze.enforce_frozen_on_startup)
+  if not ok_guard then
+    logger:warn("[startup] enforce_frozen_on_startup failed: " .. tostring(err_guard))
+  end
   millennium.ready()
 end
 

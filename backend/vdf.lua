@@ -162,6 +162,7 @@ function M.parse_manifest(text)
     scheduledAutoUpdate = tonumber(state.ScheduledAutoUpdate) or 0,
     installdir = tostring(state.installdir or ""),
     betakey = betakey or "public",
+    hasStagedDepots = type(state.StagedDepots) == "table",
     installedDepots = depots,
   }
 end
@@ -169,11 +170,13 @@ end
 --- Format-preserving in-place patch of an appmanifest_<appid>.acf string.
 --- `top_updates`: map of top-level AppState key -> string value (e.g. StateFlags = "4").
 --- `depot_manifests`: optional map of depotId -> new manifest gid string.
+--- `remove_sections`: optional set of top-level AppState subsection names to strip (e.g. { StagedDepots = true }).
 ---@param raw string
 ---@param top_updates table<string, string>
 ---@param depot_manifests table<string, string>|nil
+---@param remove_sections table<string, boolean>|nil
 ---@return string
-function M.patch_manifest(raw, top_updates, depot_manifests)
+function M.patch_manifest(raw, top_updates, depot_manifests, remove_sections)
   local lines = {}
   for line in (raw .. "\n"):gmatch("(.-)\r?\n") do
     lines[#lines + 1] = line
@@ -187,44 +190,69 @@ function M.patch_manifest(raw, top_updates, depot_manifests)
   local section_stack = {}
   local current_key = nil
   local seen_top = {}
+  local skip_depth = nil
+  local out_lines = {}
 
   for i = 1, #lines do
     local line = lines[i]
     local trimmed = line:match("^%s*(.-)%s*$")
 
-    if trimmed == "{" then
+    if skip_depth ~= nil then
+      if trimmed == "{" then
+        depth = depth + 1
+      elseif trimmed == "}" then
+        depth = math.max(0, depth - 1)
+        if depth < skip_depth then
+          skip_depth = nil
+        end
+      end
+    elseif trimmed == "{" then
       depth = depth + 1
       section_stack[depth] = current_key
+      if remove_sections and depth == 2 and section_stack[1] == "AppState" and current_key and remove_sections[current_key] then
+        -- Drop the section key line that was just appended to out_lines
+        if #out_lines > 0 then
+          table.remove(out_lines)
+        end
+        skip_depth = depth
+      else
+        out_lines[#out_lines + 1] = line
+      end
       current_key = nil
     elseif trimmed == "}" then
       section_stack[depth] = nil
       depth = math.max(0, depth - 1)
       current_key = nil
+      out_lines[#out_lines + 1] = line
     else
       local k, ws_mid, v = line:match('^%s*"([^"]+)"(%s+)"([^"]*)"%s*$')
       if k and v then
         if depth == 1 and section_stack[1] == "AppState" then
           if top_updates and top_updates[k] ~= nil then
             local indent = line:match("^(%s*)") or "\t"
-            lines[i] = indent .. '"' .. k .. '"' .. ws_mid .. '"' .. escape_vdf(top_updates[k]) .. '"'
+            line = indent .. '"' .. k .. '"' .. ws_mid .. '"' .. escape_vdf(top_updates[k]) .. '"'
             seen_top[k] = true
           end
         elseif depth == 3 and section_stack[1] == "AppState" and section_stack[2] == "InstalledDepots" then
           local depot_id = section_stack[3]
           if k == "manifest" and depot_manifests and depot_id and depot_manifests[depot_id] ~= nil then
             local indent = line:match("^(%s*)") or "\t\t\t"
-            lines[i] = indent .. '"manifest"' .. ws_mid .. '"' .. escape_vdf(depot_manifests[depot_id]) .. '"'
+            line = indent .. '"manifest"' .. ws_mid .. '"' .. escape_vdf(depot_manifests[depot_id]) .. '"'
           end
         end
         current_key = nil
+        out_lines[#out_lines + 1] = line
       else
         local only_key = trimmed:match('^"([^"]+)"$')
         if only_key then
           current_key = only_key
         end
+        out_lines[#out_lines + 1] = line
       end
     end
   end
+
+  lines = out_lines
 
   -- Insert any top_updates keys that weren't present in the file before the final "}"
   if top_updates then

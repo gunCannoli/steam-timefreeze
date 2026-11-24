@@ -142,6 +142,7 @@ function M.purge_download_cache(appid, library_hint)
   local str_id = tostring(appid)
   local count = 0
   local search_roots = library_hint and { library_hint } or M.library_roots()
+  local ok_fs, fs = pcall(require, "fs")
 
   for _, lib in ipairs(search_roots) do
     for _, sa in ipairs(steamapps_variants(lib)) do
@@ -151,6 +152,31 @@ function M.purge_download_cache(appid, library_hint)
         platform.join(sa, "downloading", str_id .. ".patch"),
         platform.join(sa, "downloading", "state_" .. str_id .. ".patch"),
       }
+      local seen_targets = {}
+      for _, t in ipairs(targets) do
+        seen_targets[t] = true
+      end
+
+      -- Also catch per-depot patch/state files (e.g. state_<appid>_<depotid>.patch)
+      local dl_dir = platform.join(sa, "downloading")
+      if ok_fs and fs and fs.list and path_exists(dl_dir) then
+        local ok_list, entries = pcall(fs.list, dl_dir)
+        if ok_list and type(entries) == "table" then
+          local p1 = "^" .. str_id .. "[_%.].*%.patch$"
+          local p2 = "^state_" .. str_id .. "[_%.].*%.patch$"
+          for _, item in ipairs(entries) do
+            local name = type(item) == "table" and tostring(item.name or "") or tostring(item)
+            if name ~= "" and (name:match(p1) or name:match(p2)) then
+              local full = platform.join(dl_dir, name)
+              if not seen_targets[full] then
+                seen_targets[full] = true
+                targets[#targets + 1] = full
+              end
+            end
+          end
+        end
+      end
+
       for _, t in ipairs(targets) do
         if path_exists(t) then
           local ok = safe_remove_path(t)
@@ -352,14 +378,21 @@ function M.freeze(appid, latest_buildid, latest_depots)
   -- Build depot manifest replacements for installed depots only
   local depot_updates = {}
   local real_depots = entry.realDepots or manifest.installedDepots or {}
-  if type(latest_depots) == "table" then
-    for depot_id, _ in pairs(real_depots) do
-      local gid = latest_depots[tostring(depot_id)]
-      if type(gid) == "string" and gid ~= "" then
-        depot_updates[tostring(depot_id)] = gid
-      end
+  local depots_total = 0
+  local depots_spoofed = 0
+  local depots_unmatched = {}
+  for depot_id, _ in pairs(real_depots) do
+    local d = tostring(depot_id)
+    depots_total = depots_total + 1
+    local gid = type(latest_depots) == "table" and latest_depots[d] or nil
+    if type(gid) == "string" and gid ~= "" then
+      depot_updates[d] = gid
+      depots_spoofed = depots_spoofed + 1
+    else
+      depots_unmatched[#depots_unmatched + 1] = d
     end
   end
+  table.sort(depots_unmatched)
 
   -- Comprehensive sanitization of all update/download/resume flags
   local top_updates = {
@@ -379,11 +412,10 @@ function M.freeze(appid, latest_buildid, latest_depots)
     buildid = spoof_build,
   }
 
-  local patched = vdf.patch_manifest(raw, top_updates, depot_updates)
+  local patched = vdf.patch_manifest(raw, top_updates, depot_updates, { StagedDepots = true })
 
   -- Purge leftover downloading/staging files so Steam doesn't revive a paused update on startup
   local purged = M.purge_download_cache(appid, lib_root)
-  logger:info(string.format("[timefreeze] freeze appid=%d: purged %d download cache item(s)", appid, purged))
 
   -- Ensure writable before writing
   file_attrs.set_readonly(manifest_path, false)
@@ -409,7 +441,20 @@ function M.freeze(appid, latest_buildid, latest_depots)
     logger:warn("[timefreeze] state_store.save failed for appid=" .. tostring(appid) .. ": " .. tostring(serr))
   end
 
-  logger:info(string.format("[timefreeze] frozen appid=%d real=%s spoof=%s ro=%s", appid, tostring(entry.realBuildId), tostring(spoof_build), tostring(rook == true)))
+  logger:info(string.format(
+    "[timefreeze] frozen appid=%d real=%s spoof=%s target_arg=%s state_flags=%s->4 depots=%d/%d unmatched=[%s] staged_cleared=%s ro=%s purged=%d",
+    appid,
+    tostring(entry.realBuildId),
+    tostring(spoof_build),
+    tostring(latest_buildid or ""),
+    tostring(manifest.stateFlags),
+    depots_spoofed,
+    depots_total,
+    table.concat(depots_unmatched, ","),
+    tostring(manifest.hasStagedDepots == true),
+    tostring(rook == true),
+    purged
+  ))
 
   local updated_manifest = vdf.parse_manifest(patched) or manifest
   return build_status(appid, manifest_path, updated_manifest, entry, rook == true)
@@ -489,32 +534,79 @@ function M.sync_frozen(appid, latest_buildid, latest_depots)
   end
 
   local is_ro = file_attrs.is_readonly(manifest_path)
-  local need_sync = (not is_ro)
-  if type(latest_buildid) == "string" and latest_buildid ~= "" and latest_buildid ~= tostring(entry.spoofedBuildId or "") then
-    need_sync = true
+  local reasons = {}
+  if not is_ro then
+    reasons[#reasons + 1] = "not_ro"
   end
-  if not need_sync and type(latest_depots) == "table" and type(entry.realDepots) == "table" then
+  if type(latest_buildid) == "string" and latest_buildid ~= "" and latest_buildid ~= tostring(entry.spoofedBuildId or "") then
+    reasons[#reasons + 1] = string.format("build_mismatch(%s->%s)", tostring(entry.spoofedBuildId or ""), latest_buildid)
+  end
+  if type(latest_depots) == "table" and type(entry.realDepots) == "table" then
     local cur_spoof = type(entry.spoofedDepots) == "table" and entry.spoofedDepots or {}
     for depot_id, _ in pairs(entry.realDepots) do
       local d = tostring(depot_id)
       local gid = latest_depots[d]
       if type(gid) == "string" and gid ~= "" and gid ~= cur_spoof[d] then
-        need_sync = true
+        reasons[#reasons + 1] = string.format("depot_mismatch(%s:%s->%s)", d, tostring(cur_spoof[d] or "nil"), gid)
         break
       end
     end
   end
 
-  if not need_sync then
+  if #reasons == 0 then
     return { synced = false, reason = "up_to_date" }
   end
 
-  logger:info(string.format("[timefreeze] auto-syncing appid=%d to latest_buildid=%s", appid, tostring(latest_buildid)))
+  logger:info(string.format("[timefreeze] auto-syncing appid=%d to latest_buildid=%s reasons=[%s]", appid, tostring(latest_buildid), table.concat(reasons, ",")))
   local res = M.freeze(appid, latest_buildid, latest_depots)
   if res.error then
     return { synced = false, error = res.error }
   end
   return { synced = true, status = res }
+end
+
+--- Immediate backend startup guard (runs in on_load before Steam's download manager finishes booting).
+--- Purges any leftover download/temp caches and repairs dirty/writable frozen manifests.
+---@return integer repaired_count
+function M.enforce_frozen_on_startup()
+  local state = state_store.load()
+  local repaired = 0
+  for _, entry in pairs(state.games) do
+    if type(entry) == "table" and entry.frozen == true and tonumber(entry.appid) then
+      local appid = tonumber(entry.appid)
+      local manifest_path, lib_root = M.find_manifest(appid)
+      if manifest_path then
+        local purged = M.purge_download_cache(appid, lib_root)
+        local raw = read_file(manifest_path)
+        local manifest = raw and vdf.parse_manifest(raw) or nil
+        local is_ro = file_attrs.is_readonly(manifest_path) == true
+
+        if manifest then
+          local dirty = {}
+          if not is_ro then dirty[#dirty + 1] = "not_ro" end
+          if manifest.stateFlags ~= 4 then dirty[#dirty + 1] = "StateFlags=" .. tostring(manifest.stateFlags) end
+          if manifest.targetBuildId ~= "0" and manifest.targetBuildId ~= "" then dirty[#dirty + 1] = "TargetBuildID=" .. tostring(manifest.targetBuildId) end
+          if manifest.bytesToDownload > 0 then dirty[#dirty + 1] = "BytesToDownload=" .. tostring(manifest.bytesToDownload) end
+          if manifest.hasStagedDepots then dirty[#dirty + 1] = "StagedDepots" end
+          if type(entry.spoofedBuildId) == "string" and entry.spoofedBuildId ~= "" and manifest.buildid ~= entry.spoofedBuildId then
+            dirty[#dirty + 1] = string.format("buildid=%s!=%s", tostring(manifest.buildid), tostring(entry.spoofedBuildId))
+          end
+
+          if #dirty > 0 then
+            local spoof_depots = type(entry.spoofedDepots) == "table" and entry.spoofedDepots or {}
+            local res = M.freeze(appid, entry.spoofedBuildId, spoof_depots)
+            repaired = repaired + 1
+            logger:info(string.format("[timefreeze] startup-guard repaired appid=%d reasons=[%s] purged=%d err=%s", appid, table.concat(dirty, ","), purged, tostring(res.error or "none")))
+          else
+            logger:info(string.format("[timefreeze] startup-guard ok appid=%d buildid=%s ro=%s purged=%d", appid, tostring(manifest.buildid), tostring(is_ro), purged))
+          end
+        end
+      else
+        logger:warn(string.format("[timefreeze] startup-guard manifest missing for frozen appid=%d", appid))
+      end
+    end
+  end
+  return repaired
 end
 
 --- Save a custom SteamDB depot+manifest entry so it appears in the version dropdown.

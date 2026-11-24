@@ -1,6 +1,6 @@
 {
   "name": "steam-timefreeze",
-  "version": "0.1.5-beta",
+  "version": "0.1.6-beta",
   "private": true,
   "description": "Freeze any Steam game at its current version from its Properties dialog so Steam will not update it or force an update on launch.",
   "scripts": {
