@@ -76,4 +76,23 @@ M.TimefreezeAddCustomVersion = wrap("TimefreezeAddCustomVersion", function(data)
   return timefreeze.add_custom_version(appid, depot_id, manifest_id)
 end)
 
+M.TimefreezePurgeCache = wrap("TimefreezePurgeCache", function(data)
+  local appid = normalize_appid(data.appid)
+  if not appid or appid <= 0 then return { error = "invalid appid" } end
+  return timefreeze.purge_cache(appid)
+end)
+
+M.TimefreezeLog = wrap("TimefreezeLog", function(data)
+  local level = tostring(data.level or "info"):lower()
+  local msg = tostring(data.message or "")
+  if level == "error" then
+    logger:error("[frontend] " .. msg)
+  elseif level == "warn" then
+    logger:warn("[frontend] " .. msg)
+  else
+    logger:info("[frontend] " .. msg)
+  end
+  return { ok = true }
+end)
+
 return M

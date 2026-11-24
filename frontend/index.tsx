@@ -10,7 +10,12 @@ import { TimefreezePage } from "./ui/timefreeze-page";
 import { backend } from "./ports/backend";
 import { fetchSteamAppInfo } from "./steam/app-info";
 import { resolveLatestTarget } from "./domain/versions";
-import { logger } from "./logger";
+import { logger, setLogListener } from "./logger";
+
+// Pipe frontend logs to backend root log file
+setLogListener((level, message) => {
+    void backend.logToServer(level, message);
+});
 
 async function syncAllFrozenOnStartup(): Promise<void> {
     try {
@@ -53,5 +58,5 @@ export default async function OnPluginLoaded(): Promise<void> {
     // Delay startup sync slightly so Steam's console & PICS cache are initialized.
     setTimeout(() => {
         void syncAllFrozenOnStartup();
-    }, 6000);
+    }, 4000);
 }

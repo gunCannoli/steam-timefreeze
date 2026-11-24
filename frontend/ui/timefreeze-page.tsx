@@ -188,6 +188,30 @@ export function TimefreezePage({ appid }: { appid: number }) {
         }
     };
 
+    const handlePurgeAndFreeze = async () => {
+        if (!status || busy) return;
+        setBusy(true);
+        setError("");
+        setMessage("Purging cached update files & re-applying freeze...");
+        try {
+            await backend.purgeCache(appid);
+            const res = await backend.freeze(appid, latestBuildId, latestDepots);
+            setDisplayStatus(liveDisplayStatus(appid));
+            if (res.error) {
+                setError(res.error);
+                setMessage("");
+            } else {
+                setStatus(res);
+                setMessage("Purged download cache & re-locked manifest. Restart Steam now to refresh the Play button.");
+            }
+        } catch (err) {
+            setError(String(err));
+            setMessage("");
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const handleRestartSteam = () => {
         const sc = steamClient();
         if (sc?.User?.StartRestart) {
@@ -384,6 +408,10 @@ export function TimefreezePage({ appid }: { appid: number }) {
     const primaryDisabled =
         busy || (selected?.kind === "latest" && !status.frozen);
 
+    const purgeAction = (status.frozen && steamStillShowsUpdate)
+        ? () => void handlePurgeAndFreeze()
+        : null;
+
     return (
         <div style={{ minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}>
             <PanelSection title="Timefreeze">
@@ -438,6 +466,15 @@ export function TimefreezePage({ appid }: { appid: number }) {
                         }
                     >
                         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+                            {purgeAction && (
+                                <DialogButton
+                                    style={BUTTON_STYLE}
+                                    disabled={busy}
+                                    onClick={purgeAction}
+                                >
+                                    Purge Cache & Lock
+                                </DialogButton>
+                            )}
                             {secondaryAction && (
                                 <DialogButton
                                     style={BUTTON_STYLE}

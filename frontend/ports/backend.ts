@@ -174,4 +174,17 @@ export const backend = {
         });
         return normalizeStatus(res);
     },
+
+    async purgeCache(appid: number): Promise<GameFreezeStatus> {
+        const res = await callRpc<unknown>("TimefreezePurgeCache", { appid });
+        return normalizeStatus(res);
+    },
+
+    async logToServer(level: "info" | "warn" | "error", message: string): Promise<void> {
+        try {
+            await callRpc("TimefreezeLog", { level, message });
+        } catch {
+            /* ignore logging failure */
+        }
+    },
 };

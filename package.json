@@ -1,12 +1,15 @@
 {
   "name": "steam-timefreeze",
-  "version": "0.1.0",
+  "version": "0.1.5-beta",
   "private": true,
   "description": "Freeze any Steam game at its current version from its Properties dialog so Steam will not update it or force an update on launch.",
   "scripts": {
     "check": "tsc --noEmit",
     "build": "millennium-ttc --build prod",
-    "build:dev": "millennium-ttc --build dev"
+    "build:dev": "millennium-ttc --build dev",
+    "dev": "powershell -ExecutionPolicy Bypass -File dev.ps1",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:lua": "lua tests/test_portability.lua && lua tests/test_globals.lua && lua tests/test_backend.lua"
   },
   "dependencies": {
     "@steambrew/client": "^5.8.5",

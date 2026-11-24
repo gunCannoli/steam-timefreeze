@@ -1,4 +1,5 @@
---- Core Timefreeze backend operations: manifest discovery, status, freeze, unfreeze, startup sync.
+--- Core Timefreeze backend operations: manifest discovery, status, freeze, unfreeze, startup sync,
+--- and update cache cleanup/purging for pending updates.
 
 local logger = require("logger")
 local platform = require("platform")
@@ -36,8 +37,17 @@ local function write_file(path, text)
   local f, err = io.open(path, "wb")
   if not f then return false, tostring(err or "open failed") end
   f:write(text)
+  f:flush()
   f:close()
   return true, nil
+end
+
+--- Return candidate steamapps directory names (handles Linux case-sensitivity: steamapps vs SteamApps).
+local function steamapps_variants(lib_root)
+  return {
+    platform.join(lib_root, "steamapps"),
+    platform.join(lib_root, "SteamApps"),
+  }
 end
 
 --- Return all Steam library root paths (main Steam root + libraryfolders.vdf entries).
@@ -47,34 +57,114 @@ function M.library_roots()
   local roots = { root }
   local seen = { [root:lower()] = true }
 
-  local lf_path = platform.join(root, "steamapps", "libraryfolders.vdf")
-  local raw = read_file(lf_path)
-  if raw then
-    for _, lib in ipairs(vdf.library_paths(raw)) do
-      local key = lib:lower()
-      if not seen[key] then
-        seen[key] = true
-        roots[#roots + 1] = lib
+  for _, sa in ipairs(steamapps_variants(root)) do
+    local lf_path = platform.join(sa, "libraryfolders.vdf")
+    local raw = read_file(lf_path)
+    if raw then
+      for _, lib in ipairs(vdf.library_paths(raw)) do
+        local key = lib:lower()
+        if not seen[key] then
+          seen[key] = true
+          roots[#roots + 1] = lib
+        end
       end
+      break
     end
   end
   return roots
 end
 
 --- Locate appmanifest_<appid>.acf across all Steam libraries.
+--- Checks both steamapps and SteamApps subdirectories for Linux case sensitivity.
 ---@param appid number
 ---@return string|nil, string|nil
 function M.find_manifest(appid)
   local fname = "appmanifest_" .. tostring(appid) .. ".acf"
   for _, lib in ipairs(M.library_roots()) do
-    local candidate = platform.join(lib, "steamapps", fname)
-    local f = io.open(candidate, "rb")
-    if f then
-      f:close()
-      return candidate, lib
+    for _, sa in ipairs(steamapps_variants(lib)) do
+      local candidate = platform.join(sa, fname)
+      local f = io.open(candidate, "rb")
+      if f then
+        f:close()
+        return candidate, lib
+      end
     end
   end
   return nil, nil
+end
+
+--- Check if a file or directory exists (using fs.exists with fallback).
+local function path_exists(path)
+  local ok_fs, fs = pcall(require, "fs")
+  if ok_fs and fs and fs.exists then
+    local ok, ex = pcall(fs.exists, path)
+    if ok and ex ~= nil then return ex == true end
+  end
+  local f = io.open(path, "rb")
+  if f then
+    f:close()
+    return true
+  end
+  local probe = path .. "/.probe"
+  local f_dir = io.open(probe, "wb")
+  if f_dir then
+    f_dir:close()
+    os.remove(probe)
+    return true
+  end
+  return false
+end
+
+--- Recursively remove a path (file or folder) using Millennium fs if available, fallback os.remove.
+local function safe_remove_path(target)
+  local ok_fs, fs = pcall(require, "fs")
+  if ok_fs and fs then
+    if fs.remove_all then
+      local ok = pcall(fs.remove_all, target)
+      if ok and not (fs.exists and fs.exists(target)) then return true end
+    end
+    if fs.remove then
+      local ok = pcall(fs.remove, target)
+      if ok and not (fs.exists and fs.exists(target)) then return true end
+    end
+  end
+  local ok = os.remove(target)
+  return ok == true
+end
+
+--- Purge any pending update downloads, staging folders, or patch state for this appid.
+--- Steam caches in-progress updates in steamapps/downloading/<appid>, steamapps/temp/<appid>,
+--- and patch metadata files. If these are left on disk, Steam on restart restores the Update button!
+---@param appid number
+---@param library_hint string|nil
+---@return integer count number of items removed
+function M.purge_download_cache(appid, library_hint)
+  local str_id = tostring(appid)
+  local count = 0
+  local search_roots = library_hint and { library_hint } or M.library_roots()
+
+  for _, lib in ipairs(search_roots) do
+    for _, sa in ipairs(steamapps_variants(lib)) do
+      local targets = {
+        platform.join(sa, "downloading", str_id),
+        platform.join(sa, "temp", str_id),
+        platform.join(sa, "downloading", str_id .. ".patch"),
+        platform.join(sa, "downloading", "state_" .. str_id .. ".patch"),
+      }
+      for _, t in ipairs(targets) do
+        if path_exists(t) then
+          local ok = safe_remove_path(t)
+          if ok then
+            count = count + 1
+            logger:info("[timefreeze] purged download cache target: " .. t)
+          else
+            logger:warn("[timefreeze] failed to purge download cache target: " .. t)
+          end
+        end
+      end
+    end
+  end
+  return count
 end
 
 local function depots_to_manifest_map(installed_depots)
@@ -141,11 +231,13 @@ local function build_status(appid, manifest_path, manifest, entry, is_ro)
 end
 
 --- Read current status for an installed Steam game.
+--- Includes self-healing if state.json was desynced but the manifest is read-only on disk.
 ---@param appid number
 ---@return table
 function M.get_status(appid)
-  local manifest_path = M.find_manifest(appid)
+  local manifest_path, lib_root = M.find_manifest(appid)
   if not manifest_path then
+    logger:info("[timefreeze] get_status: manifest not found for appid=" .. tostring(appid))
     return {
       found = false,
       appid = appid,
@@ -163,6 +255,7 @@ function M.get_status(appid)
 
   local manifest = vdf.parse_manifest(raw)
   if not manifest then
+    logger:error("[timefreeze] parse_manifest failed for appid=" .. tostring(appid))
     return { error = "Could not parse appmanifest" }
   end
 
@@ -170,6 +263,27 @@ function M.get_status(appid)
   local state = state_store.load()
   local key = tostring(appid)
   local entry = state.games[key]
+
+  -- Self-healing fallback: if entry is missing from state.json, but the manifest file is read-only
+  -- on disk and StateFlags is 4, restore frozen entry so restarting Steam never loses the freeze badge!
+  if (type(entry) ~= "table" or not entry.frozen) and is_ro == true and manifest.stateFlags == 4 then
+    logger:info("[timefreeze] self-healing: detected read-only manifest for appid=" .. tostring(appid) .. ", auto-restoring frozen state")
+    entry = {
+      appid = appid,
+      name = manifest.name,
+      frozen = true,
+      frozenAt = now_sec(),
+      realBuildId = manifest.buildid,
+      spoofedBuildId = manifest.buildid,
+      realLastUpdated = manifest.lastUpdated,
+      realAutoUpdateBehavior = tostring(manifest.autoUpdateBehavior),
+      realDepots = manifest.installedDepots,
+      history = {},
+    }
+    record_history(entry, manifest.buildid, manifest.lastUpdated, manifest.installedDepots)
+    state.games[key] = entry
+    state_store.save(state)
+  end
 
   -- Record currently installed build in local history if not frozen (so we only log true builds)
   if not (type(entry) == "table" and entry.frozen == true) and manifest.buildid ~= "" then
@@ -189,13 +303,14 @@ end
 
 --- Freeze an installed game at its currently installed build.
 --- Spoofs appmanifest buildid & InstalledDepots to latest_buildid / latest_depots,
---- sets StateFlags = "4", clears pending update fields, and sets file Read-Only.
+--- purges pending download and staging caches, wipes all update/resume flags,
+--- and sets the file Read-Only.
 ---@param appid number
 ---@param latest_buildid string|nil
 ---@param latest_depots table<string, string>|nil
 ---@return table
 function M.freeze(appid, latest_buildid, latest_depots)
-  local manifest_path = M.find_manifest(appid)
+  local manifest_path, lib_root = M.find_manifest(appid)
   if not manifest_path then
     return { error = "Game is not installed (appmanifest not found)." }
   end
@@ -246,6 +361,7 @@ function M.freeze(appid, latest_buildid, latest_depots)
     end
   end
 
+  -- Comprehensive sanitization of all update/download/resume flags
   local top_updates = {
     StateFlags = "4",
     BytesToDownload = "0",
@@ -255,10 +371,19 @@ function M.freeze(appid, latest_buildid, latest_depots)
     TargetBuildID = "0",
     ScheduledAutoUpdate = "0",
     AutoUpdateBehavior = "1",
+    UpdateResult = "0",
+    DownloadType = "0",
+    FullValidateBeforeNextUpdate = "0",
+    FullValidateAfterNextUpdate = "0",
+    StagingSize = "0",
     buildid = spoof_build,
   }
 
   local patched = vdf.patch_manifest(raw, top_updates, depot_updates)
+
+  -- Purge leftover downloading/staging files so Steam doesn't revive a paused update on startup
+  local purged = M.purge_download_cache(appid, lib_root)
+  logger:info(string.format("[timefreeze] freeze appid=%d: purged %d download cache item(s)", appid, purged))
 
   -- Ensure writable before writing
   file_attrs.set_readonly(manifest_path, false)
@@ -270,21 +395,24 @@ function M.freeze(appid, latest_buildid, latest_depots)
 
   local rook, roerr = file_attrs.set_readonly(manifest_path, true)
   if not rook then
-    logger:error("[timefreeze] set_readonly failed for appid=" .. tostring(appid) .. ": " .. tostring(roerr))
-    return { error = "Updated manifest, but could not set read-only: " .. tostring(roerr) }
+    logger:warn(string.format("[timefreeze] set_readonly warning for appid=%d: %s (non-fatal; filesystem may be exFAT/NTFS, manifest spoofing still active)", appid, tostring(roerr)))
   end
 
   entry.frozen = true
   entry.frozenAt = now_sec()
   entry.spoofedBuildId = spoof_build
   entry.spoofedDepots = depot_updates
+  entry.readonly = rook == true
   state.games[key] = entry
-  state_store.save(state)
+  local sok, serr = state_store.save(state)
+  if not sok then
+    logger:warn("[timefreeze] state_store.save failed for appid=" .. tostring(appid) .. ": " .. tostring(serr))
+  end
 
-  logger:info("[timefreeze] frozen appid=" .. tostring(appid) .. " real=" .. tostring(entry.realBuildId) .. " spoof=" .. tostring(spoof_build))
+  logger:info(string.format("[timefreeze] frozen appid=%d real=%s spoof=%s ro=%s", appid, tostring(entry.realBuildId), tostring(spoof_build), tostring(rook == true)))
 
   local updated_manifest = vdf.parse_manifest(patched) or manifest
-  return build_status(appid, manifest_path, updated_manifest, entry, true)
+  return build_status(appid, manifest_path, updated_manifest, entry, rook == true)
 end
 
 --- Unfreeze a game: remove Read-Only and restore the real buildid & depot manifests.
@@ -302,8 +430,7 @@ function M.unfreeze(appid)
 
   local rok, rerr = file_attrs.set_readonly(manifest_path, false)
   if not rok then
-    logger:error("[timefreeze] clear readonly failed for appid=" .. tostring(appid) .. ": " .. tostring(rerr))
-    return { error = "Could not clear read-only attribute: " .. tostring(rerr) }
+    logger:warn(string.format("[timefreeze] clear readonly warning for appid=%d: %s (attempting write anyway)", appid, tostring(rerr)))
   end
 
   local raw, read_err = read_file(manifest_path)
@@ -382,6 +509,7 @@ function M.sync_frozen(appid, latest_buildid, latest_depots)
     return { synced = false, reason = "up_to_date" }
   end
 
+  logger:info(string.format("[timefreeze] auto-syncing appid=%d to latest_buildid=%s", appid, tostring(latest_buildid)))
   local res = M.freeze(appid, latest_buildid, latest_depots)
   if res.error then
     return { synced = false, error = res.error }
@@ -446,6 +574,19 @@ function M.list_frozen()
   end
   table.sort(appids)
   return { appids = appids }
+end
+
+--- Direct trigger to purge downloading caches and re-assert clean manifest state.
+---@param appid number
+---@return table
+function M.purge_cache(appid)
+  local manifest_path, lib_root = M.find_manifest(appid)
+  if not manifest_path then
+    return { error = "Game is not installed." }
+  end
+  local purged = M.purge_download_cache(appid, lib_root)
+  logger:info(string.format("[timefreeze] manual purge for appid=%d: removed %d item(s)", appid, purged))
+  return M.get_status(appid)
 end
 
 return M
