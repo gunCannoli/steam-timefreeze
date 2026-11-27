@@ -1,7 +1,7 @@
 --- Core Timefreeze backend operations: manifest discovery, status, freeze, unfreeze, startup sync,
 --- and update cache cleanup/purging for pending updates.
 
-local logger = require("logger")
+local logger = require("log").logger
 local platform = require("platform")
 local file_attrs = require("file_attrs")
 local vdf = require("vdf")
@@ -206,6 +206,22 @@ local function depots_to_manifest_map(installed_depots)
   return out
 end
 
+--- depotId -> dlcappid for every DLC depot named in any of the given InstalledDepots tables
+--- (state.json from 0.1.6 and older lacks dlcappid, so the live manifest is merged in too).
+local function depots_dlc_map(...)
+  local out = {}
+  for _, installed_depots in ipairs({ ... }) do
+    if type(installed_depots) == "table" then
+      for depot_id, info in pairs(installed_depots) do
+        if type(info) == "table" and type(info.dlcappid) == "string" and info.dlcappid ~= "" then
+          out[tostring(depot_id)] = info.dlcappid
+        end
+      end
+    end
+  end
+  return out
+end
+
 local function record_history(entry, buildid, date_sec, depots)
   if type(buildid) ~= "string" or buildid == "" or buildid == "0" then return end
   if type(entry.history) ~= "table" then entry.history = {} end
@@ -244,6 +260,7 @@ local function build_status(appid, manifest_path, manifest, entry, is_ro)
     installedBuildId = installed_build,
     installedDate = installed_date,
     installedDepots = depots_to_manifest_map(installed_depots),
+    installedDepotDlc = depots_dlc_map(installed_depots, manifest.installedDepots),
     manifestBuildId = manifest.buildid,
     targetBuildId = manifest.targetBuildId,
     stateFlags = manifest.stateFlags,
@@ -381,6 +398,9 @@ function M.freeze(appid, latest_buildid, latest_depots)
   local depots_total = 0
   local depots_spoofed = 0
   local depots_unmatched = {}
+  local depots_kept = 0
+  local prev_spoof = (entry.frozen and type(entry.spoofedDepots) == "table") and entry.spoofedDepots or {}
+  local dlc_of = depots_dlc_map(real_depots, manifest.installedDepots)
   for depot_id, _ in pairs(real_depots) do
     local d = tostring(depot_id)
     depots_total = depots_total + 1
@@ -388,11 +408,21 @@ function M.freeze(appid, latest_buildid, latest_depots)
     if type(gid) == "string" and gid ~= "" then
       depot_updates[d] = gid
       depots_spoofed = depots_spoofed + 1
+    elseif type(prev_spoof[d]) == "string" and prev_spoof[d] ~= "" then
+      -- Fallback: a later freeze with less app info (Web API down, console off) keeps the earlier
+      -- spoof instead of putting the real, outdated manifest back (which re-arms Steam's update).
+      depot_updates[d] = prev_spoof[d]
+      depots_kept = depots_kept + 1
     else
-      depots_unmatched[#depots_unmatched + 1] = d
+      depots_unmatched[#depots_unmatched + 1] = dlc_of[d] and (d .. "(dlc " .. dlc_of[d] .. ")") or d
     end
   end
   table.sort(depots_unmatched)
+  if #depots_unmatched > 0 then
+    logger:warn(string.format(
+      "[timefreeze] freeze appid=%d: %d depot(s) have no latest manifest and keep the installed one, so Steam may still show Update: [%s]",
+      appid, #depots_unmatched, table.concat(depots_unmatched, ",")))
+  end
 
   -- Comprehensive sanitization of all update/download/resume flags
   local top_updates = {
@@ -442,7 +472,7 @@ function M.freeze(appid, latest_buildid, latest_depots)
   end
 
   logger:info(string.format(
-    "[timefreeze] frozen appid=%d real=%s spoof=%s target_arg=%s state_flags=%s->4 depots=%d/%d unmatched=[%s] staged_cleared=%s ro=%s purged=%d",
+    "[timefreeze] frozen appid=%d real=%s spoof=%s target_arg=%s state_flags=%s->4 depots=%d/%d kept=%d unmatched=[%s] staged_cleared=%s ro=%s purged=%d",
     appid,
     tostring(entry.realBuildId),
     tostring(spoof_build),
@@ -450,6 +480,7 @@ function M.freeze(appid, latest_buildid, latest_depots)
     tostring(manifest.stateFlags),
     depots_spoofed,
     depots_total,
+    depots_kept,
     table.concat(depots_unmatched, ","),
     tostring(manifest.hasStagedDepots == true),
     tostring(rook == true),
@@ -571,6 +602,15 @@ end
 function M.enforce_frozen_on_startup()
   local state = state_store.load()
   local repaired = 0
+  local frozen_ids = {}
+  for _, entry in pairs(state.games) do
+    if type(entry) == "table" and entry.frozen == true and tonumber(entry.appid) then
+      frozen_ids[#frozen_ids + 1] = tostring(entry.appid)
+    end
+  end
+  table.sort(frozen_ids)
+  logger:info(string.format("[timefreeze] startup-guard: %d frozen game(s) [%s], %d library root(s)",
+    #frozen_ids, table.concat(frozen_ids, ","), #M.library_roots()))
   for _, entry in pairs(state.games) do
     if type(entry) == "table" and entry.frozen == true and tonumber(entry.appid) then
       local appid = tonumber(entry.appid)
@@ -600,6 +640,11 @@ function M.enforce_frozen_on_startup()
           else
             logger:info(string.format("[timefreeze] startup-guard ok appid=%d buildid=%s ro=%s purged=%d", appid, tostring(manifest.buildid), tostring(is_ro), purged))
           end
+          -- Steam's content_log still holds the last session: why it wanted to update this game.
+          local ok_diag, err_diag = pcall(M.diagnose, appid, { reason = "startup", latestDepots = entry.spoofedDepots })
+          if not ok_diag then logger:warn("[timefreeze] startup diagnose failed: " .. tostring(err_diag)) end
+        else
+          logger:warn(string.format("[timefreeze] startup-guard appid=%d manifest unparsable", appid))
         end
       else
         logger:warn(string.format("[timefreeze] startup-guard manifest missing for frozen appid=%d", appid))
@@ -607,6 +652,155 @@ function M.enforce_frozen_on_startup()
     end
   end
   return repaired
+end
+
+M.CONTENT_LOG_TAIL_BYTES = 768 * 1024
+M.CONTENT_LOG_MAX_LINES = 14
+
+--- Steam's own record of why it wants to update an app: `<Steam>/logs/content_log.txt` lines
+--- `AppID <id> state changed : Update Required,...`, `config changed : updated depots a,b`,
+--- `update started/canceled`, and `Downloading N chunks for depot <d>`. Same file on every OS.
+---@param appid number
+---@param depot_ids table<string, boolean>|nil
+---@return table { found, lines, updatedDepots }
+function M.read_content_log(appid, depot_ids)
+  local out = { found = false, lines = {}, updatedDepots = {} }
+  local path = platform.join(get_steam_path(), "logs", "content_log.txt")
+  local f = io.open(path, "rb")
+  if not f then return out end
+  out.found = true
+  local size = f:seek("end") or 0
+  local start = math.max(0, size - M.CONTENT_LOG_TAIL_BYTES)
+  f:seek("set", start)
+  local text = f:read("*a") or ""
+  f:close()
+
+  local needle = "AppID " .. tostring(appid) .. " "
+  local matched = {}
+  for line in text:gmatch("[^\r\n]+") do
+    local hit = line:find(needle, 1, true) ~= nil
+    if not hit and depot_ids then
+      local d = line:match("chunks for depot (%d+)")
+      hit = d ~= nil and depot_ids[d] == true
+    end
+    if hit then
+      matched[#matched + 1] = line
+      local list = line:match(needle .. "config changed : updated depots ([%d,]+)")
+      if list then
+        out.updatedDepots = {}
+        for d in list:gmatch("%d+") do out.updatedDepots[#out.updatedDepots + 1] = d end
+      end
+    end
+  end
+  local first = math.max(1, #matched - M.CONTENT_LOG_MAX_LINES + 1)
+  for i = first, #matched do out.lines[#out.lines + 1] = matched[i] end
+  return out
+end
+
+local function cache_presence(appid, lib_root)
+  local present = {}
+  for _, sa in ipairs(steamapps_variants(lib_root)) do
+    if path_exists(platform.join(sa, "downloading", tostring(appid))) then present[#present + 1] = "downloading" end
+    if path_exists(platform.join(sa, "temp", tostring(appid))) then present[#present + 1] = "temp" end
+  end
+  return present
+end
+
+--- Log everything needed to tell why Steam shows Update for a game: the manifest's update fields,
+--- every installed depot (file / spoofed / real / latest manifest), leftover caches, and Steam's own
+--- content_log lines for the app. Lines carry ids, flags and counts; no paths, names or keys.
+---@param appid number
+---@param opts table|nil { reason, displayStatus, latestBuildId, latestDepots }
+---@return table
+function M.diagnose(appid, opts)
+  opts = type(opts) == "table" and opts or {}
+  local reason = tostring(opts.reason or "manual")
+  local tag = string.format("[diag] appid=%d", appid)
+  local manifest_path, lib_root = M.find_manifest(appid)
+  if not manifest_path then
+    logger:warn(string.format("%s reason=%s manifest not found in %d library root(s)", tag, reason, #M.library_roots()))
+    return { found = false }
+  end
+  local raw = read_file(manifest_path)
+  local manifest = raw and vdf.parse_manifest(raw) or nil
+  if not manifest then
+    logger:warn(string.format("%s reason=%s manifest unreadable or unparsable", tag, reason))
+    return { found = true, error = "unparsable" }
+  end
+
+  local state = state_store.load()
+  local entry = state.games[tostring(appid)]
+  local frozen = type(entry) == "table" and entry.frozen == true
+  local is_ro = file_attrs.is_readonly(manifest_path)
+  local spoof = (frozen and type(entry.spoofedDepots) == "table") and entry.spoofedDepots or {}
+  local real = frozen and depots_to_manifest_map(entry.realDepots) or {}
+  local latest = type(opts.latestDepots) == "table" and opts.latestDepots or {}
+  local latest_known = next(latest) ~= nil
+
+  logger:info(string.format(
+    "%s reason=%s frozen=%s ro=%s display=%s StateFlags=%d buildid=%s spoof=%s real=%s latest=%s TargetBuildID=%s BytesToDownload=%d BytesToStage=%d UpdateResult=%s AutoUpdate=%d staged=%s lang=%s beta=%s depots=%d shared=%d caches=[%s]",
+    tag, reason, tostring(frozen), tostring(is_ro), tostring(opts.displayStatus or "?"),
+    manifest.stateFlags, manifest.buildid,
+    frozen and tostring(entry.spoofedBuildId or "") or "-",
+    frozen and tostring(entry.realBuildId or "") or "-",
+    tostring(opts.latestBuildId or "?"),
+    manifest.targetBuildId, manifest.bytesToDownload, manifest.bytesToStage, manifest.updateResult,
+    manifest.autoUpdateBehavior, tostring(manifest.hasStagedDepots), manifest.language, manifest.betakey,
+    (function() local n = 0 for _ in pairs(manifest.installedDepots) do n = n + 1 end return n end)(),
+    manifest.sharedDepotCount, table.concat(cache_presence(appid, lib_root), ",")))
+
+  local depot_ids = {}
+  local stale = {}
+  local ids = {}
+  for d in pairs(manifest.installedDepots) do ids[#ids + 1] = d end
+  table.sort(ids)
+  for _, d in ipairs(ids) do
+    local info = manifest.installedDepots[d]
+    depot_ids[d] = true
+    local want = latest[d]
+    local verdict
+    if not latest_known then
+      verdict = "latest-unknown"
+    elseif type(want) ~= "string" or want == "" then
+      verdict = info.dlcappid and "UNRESOLVED(dlc app info needed)" or "UNRESOLVED"
+    elseif want == info.manifest then
+      verdict = "ok"
+    else
+      verdict = "STALE"
+    end
+    if verdict ~= "ok" and verdict ~= "latest-unknown" then stale[#stale + 1] = d end
+    logger:info(string.format("%s depot=%s dlc=%s file=%s spoof=%s real=%s latest=%s -> %s",
+      tag, d, tostring(info.dlcappid or "-"), info.manifest, tostring(spoof[d] or "-"), tostring(real[d] or "-"),
+      tostring(want or "?"), verdict))
+  end
+
+  local cl = M.read_content_log(appid, depot_ids)
+  if not cl.found then
+    logger:info(string.format("%s content_log.txt not found under <Steam>/logs", tag))
+  else
+    for _, line in ipairs(cl.lines) do
+      logger:info(tag .. " steam: " .. line)
+    end
+    if #cl.updatedDepots > 0 then
+      local uncovered = {}
+      for _, d in ipairs(cl.updatedDepots) do
+        if not manifest.installedDepots[d] then uncovered[#uncovered + 1] = d end
+      end
+      logger:info(string.format("%s steam last asked to update depots=[%s] not-in-manifest=[%s]",
+        tag, table.concat(cl.updatedDepots, ","), table.concat(uncovered, ",")))
+    elseif #cl.lines == 0 then
+      logger:info(tag .. " no content_log lines for this app in the recent tail")
+    end
+  end
+
+  return {
+    found = true,
+    frozen = frozen,
+    readonly = is_ro == true,
+    stateFlags = manifest.stateFlags,
+    staleDepots = stale,
+    steamUpdatedDepots = cl.updatedDepots,
+  }
 end
 
 --- Save a custom SteamDB depot+manifest entry so it appears in the version dropdown.

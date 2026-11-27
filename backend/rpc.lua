@@ -2,7 +2,7 @@
 --- Guardrails: normalise appid unsigned, never return bare nil, log errors.
 
 local json = require("json")
-local logger = require("logger")
+local logger = require("log").logger
 local timefreeze = require("timefreeze")
 
 local M = {}
@@ -80,6 +80,17 @@ M.TimefreezePurgeCache = wrap("TimefreezePurgeCache", function(data)
   local appid = normalize_appid(data.appid)
   if not appid or appid <= 0 then return { error = "invalid appid" } end
   return timefreeze.purge_cache(appid)
+end)
+
+M.TimefreezeDiagnose = wrap("TimefreezeDiagnose", function(data)
+  local appid = normalize_appid(data.appid)
+  if not appid or appid <= 0 then return { error = "invalid appid" } end
+  return timefreeze.diagnose(appid, {
+    reason = type(data.reason) == "string" and data.reason:sub(1, 48) or "frontend",
+    displayStatus = tonumber(data.displayStatus),
+    latestBuildId = type(data.latestBuildId) == "string" and data.latestBuildId or nil,
+    latestDepots = type(data.latestDepots) == "table" and data.latestDepots or nil,
+  })
 end)
 
 M.TimefreezeLog = wrap("TimefreezeLog", function(data)

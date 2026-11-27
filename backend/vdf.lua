@@ -136,9 +136,21 @@ function M.parse_manifest(text)
         depots[tostring(depot_id)] = {
           manifest = info.manifest,
           size = tostring(info.size or "0"),
+          -- DLC depots name their DLC: their latest manifest lives in the DLC's app info, not the game's.
+          dlcappid = (type(info.dlcappid) == "string" and info.dlcappid ~= "") and info.dlcappid or nil,
         }
       end
     end
+  end
+
+  local shared_count = 0
+  if type(state.SharedDepots) == "table" then
+    for _ in pairs(state.SharedDepots) do shared_count = shared_count + 1 end
+  end
+
+  local language = nil
+  if type(state.UserConfig) == "table" and type(state.UserConfig.language) == "string" then
+    language = state.UserConfig.language
   end
 
   local betakey = nil
@@ -164,6 +176,10 @@ function M.parse_manifest(text)
     betakey = betakey or "public",
     hasStagedDepots = type(state.StagedDepots) == "table",
     installedDepots = depots,
+    sharedDepotCount = shared_count,
+    language = language or "",
+    bytesToStage = tonumber(state.BytesToStage) or 0,
+    updateResult = tostring(state.UpdateResult or ""),
   }
 end
 

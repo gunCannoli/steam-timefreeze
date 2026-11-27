@@ -22,6 +22,8 @@ export interface GameFreezeStatus {
     installedBuildId?: string;
     installedDate?: number;
     installedDepots?: Record<string, string>;
+    /** depotId -> dlcappid for DLC depots (their latest manifest is in the DLC's app info). */
+    installedDepotDlc?: Record<string, string>;
     manifestBuildId?: string;
     targetBuildId?: string;
     stateFlags?: number;
@@ -32,6 +34,13 @@ export interface GameFreezeStatus {
     history: HistoryEntry[];
     customVersions: CustomVersionEntry[];
     error?: string;
+}
+
+export interface DiagnoseResult {
+    found: boolean;
+    frozen?: boolean;
+    staleDepots: string[];
+    steamUpdatedDepots: string[];
 }
 
 export interface SyncResult {
@@ -68,6 +77,7 @@ function normalizeStatus(raw: unknown): GameFreezeStatus {
         installedBuildId: typeof r["installedBuildId"] === "string" ? r["installedBuildId"] : undefined,
         installedDate: Number(r["installedDate"]) || 0,
         installedDepots: asRecord(r["installedDepots"]),
+        installedDepotDlc: asRecord(r["installedDepotDlc"]),
         manifestBuildId: typeof r["manifestBuildId"] === "string" ? r["manifestBuildId"] : undefined,
         targetBuildId: typeof r["targetBuildId"] === "string" ? r["targetBuildId"] : undefined,
         stateFlags: Number(r["stateFlags"]) || 0,
@@ -178,6 +188,25 @@ export const backend = {
     async purgeCache(appid: number): Promise<GameFreezeStatus> {
         const res = await callRpc<unknown>("TimefreezePurgeCache", { appid });
         return normalizeStatus(res);
+    },
+
+    /** Writes the full [diag] block for this game to timefreeze.log (manifest, depots, Steam's content_log). */
+    async diagnose(
+        appid: number,
+        reason: string,
+        extra: { displayStatus?: number; latestBuildId?: string; latestDepots?: Record<string, string> } = {},
+    ): Promise<DiagnoseResult> {
+        try {
+            const res = await callRpc<Record<string, unknown>>("TimefreezeDiagnose", { appid, reason, ...extra });
+            return {
+                found: res?.["found"] === true,
+                frozen: res?.["frozen"] === true,
+                staleDepots: asArray<string>(res?.["staleDepots"]).map(String),
+                steamUpdatedDepots: asArray<string>(res?.["steamUpdatedDepots"]).map(String),
+            };
+        } catch {
+            return { found: false, staleDepots: [], steamUpdatedDepots: [] };
+        }
     },
 
     async logToServer(level: "info" | "warn" | "error", message: string): Promise<void> {

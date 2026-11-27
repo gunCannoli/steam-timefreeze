@@ -239,9 +239,15 @@ interface ConsoleClient {
     RegisterForSpewOutput?: (cb: (spew: { spew?: string }) => void) => { unregister?: () => void };
 }
 
+let consoleMissingLogged = false;
+
 async function queryConsole(appid: number, timeoutMs: number): Promise<ParsedAppInfo | null> {
     const consoleApi = (globalThis as unknown as { SteamClient?: { Console?: ConsoleClient } }).SteamClient?.Console;
     if (!consoleApi?.ExecCommand || !consoleApi?.RegisterForSpewOutput) {
+        if (!consoleMissingLogged) {
+            consoleMissingLogged = true;
+            logger.warn("SteamClient.Console unavailable: app info comes from the Web API only");
+        }
         return null;
     }
 
@@ -293,11 +299,15 @@ async function queryWebFallback(appid: number, timeoutMs = 2500): Promise<Parsed
             signal: controller?.signal,
         });
         if (timer) clearTimeout(timer);
-        if (!res.ok) return null;
+        if (!res.ok) {
+            logger.warn(`Web API fallback HTTP ${res.status} for appid=${appid}`);
+            return null;
+        }
         const json = await res.json() as { data?: unknown };
         if (json && json.data) {
             const parsed = parseSteamCmdApiData(appid, json.data);
-            if (parsed.branches.length > 0) {
+            // A DLC's app info often has depots and no branches block: its public manifests still count.
+            if (parsed.branches.length > 0 || Object.keys(parsed.branchDepots["public"] ?? {}).length > 0) {
                 return parsed;
             }
         }
@@ -321,7 +331,7 @@ export function fetchSteamAppInfo(appid: number, timeoutMs = 900): Promise<Parse
         // 1. Try SteamClient console first
         const fromConsole = await queryConsole(appid, timeoutMs);
         const consolePublicDepots = Object.keys(fromConsole?.branchDepots?.["public"] ?? {}).length;
-        if (fromConsole && fromConsole.branches.length > 0 && consolePublicDepots > 0) {
+        if (fromConsole && consolePublicDepots > 0) {
             cache.set(appid, { info: fromConsole, expires: Date.now() + 3600000 });
             logger.info(`Resolved appInfo for appid=${appid} via SteamClient.Console (${fromConsole.branches.length} branch(es), ${consolePublicDepots} public depot(s))`);
             return fromConsole;
@@ -329,7 +339,7 @@ export function fetchSteamAppInfo(appid: number, timeoutMs = 900): Promise<Parse
 
         // 2. Try Web API fallback (also used if console returned branches without depot GIDs)
         const fromWeb = await queryWebFallback(appid);
-        if (fromWeb && fromWeb.branches.length > 0) {
+        if (fromWeb && (fromWeb.branches.length > 0 || Object.keys(fromWeb.branchDepots["public"] ?? {}).length > 0)) {
             cache.set(appid, { info: fromWeb, expires: Date.now() + 3600000 });
             const webPublicDepots = Object.keys(fromWeb.branchDepots["public"] ?? {}).length;
             logger.info(`Resolved appInfo for appid=${appid} via SteamCMD Web API fallback (${fromWeb.branches.length} branch(es), ${webPublicDepots} public depot(s))`);
@@ -349,6 +359,88 @@ export function fetchSteamAppInfo(appid: number, timeoutMs = 900): Promise<Parse
     const next = queue.then(task, task);
     queue = next.catch(() => undefined);
     return next;
+}
+
+/**
+ * Installed depots that the game's own app info names no manifest for, grouped by the DLC that owns
+ * them. Games with `hasdepotsindlc` (Cyberpunk 2077's Phantom Liberty, 2138330) keep DLC depots only in
+ * the DLC's app info, so `app_info_print <game>` never lists their latest manifest. Pure.
+ */
+export function unresolvedDlcDepots(
+    parent: ParsedAppInfo,
+    installedDepotIds: string[],
+    depotDlc: Record<string, string>,
+): { byDlc: Record<string, string[]>; orphans: string[] } {
+    const known = new Set<string>();
+    for (const map of Object.values(parent.branchDepots)) {
+        for (const d of Object.keys(map)) known.add(d);
+    }
+    const byDlc: Record<string, string[]> = {};
+    const orphans: string[] = [];
+    for (const d of installedDepotIds) {
+        if (known.has(d)) continue;
+        const dlc = depotDlc[d];
+        if (dlc && dlc !== String(parent.appid)) {
+            (byDlc[dlc] ??= []).push(d);
+        } else {
+            orphans.push(d);
+        }
+    }
+    return { byDlc, orphans };
+}
+
+/**
+ * Merge DLC app infos' per-branch depot manifests into the game's (never overriding the game's own
+ * entries). A DLC branch missing from the game keeps its name, so `public` always merges. Pure.
+ */
+export function mergeDlcAppInfo(parent: ParsedAppInfo, dlcInfos: ParsedAppInfo[]): ParsedAppInfo {
+    const branchDepots: Record<string, Record<string, string>> = {};
+    for (const [b, map] of Object.entries(parent.branchDepots)) branchDepots[b] = { ...map };
+    for (const dlc of dlcInfos) {
+        for (const [b, map] of Object.entries(dlc.branchDepots)) {
+            const target = (branchDepots[b] ??= {});
+            for (const [d, gid] of Object.entries(map)) {
+                if (!target[d]) target[d] = gid;
+            }
+        }
+    }
+    return { appid: parent.appid, branches: parent.branches, branchDepots };
+}
+
+/**
+ * The game's app info plus the app info of every DLC that owns an installed depot the game's own info
+ * leaves out, so the freeze can spoof every installed depot (a stale DLC depot keeps Steam's Update button).
+ */
+export async function fetchAppInfoForInstall(
+    appid: number,
+    installedDepots: Record<string, string> | undefined,
+    depotDlc: Record<string, string> | undefined,
+): Promise<ParsedAppInfo> {
+    const parent = await fetchSteamAppInfo(appid);
+    const ids = Object.keys(installedDepots ?? {});
+    if (ids.length === 0 || parent.branches.length === 0) return parent;
+    const { byDlc, orphans } = unresolvedDlcDepots(parent, ids, depotDlc ?? {});
+    const dlcIds = Object.keys(byDlc);
+    if (dlcIds.length === 0) {
+        if (orphans.length > 0) {
+            logger.warn(`appid=${appid}: ${orphans.length} installed depot(s) not in app info and not tagged as DLC: [${orphans.join(",")}]`);
+        }
+        return parent;
+    }
+    const dlcInfos: ParsedAppInfo[] = [];
+    for (const dlc of dlcIds) {
+        const n = Number(dlc);
+        if (!Number.isFinite(n) || n <= 0) continue;
+        dlcInfos.push(await fetchSteamAppInfo(n));
+    }
+    const merged = mergeDlcAppInfo(parent, dlcInfos);
+    const still = unresolvedDlcDepots(merged, ids, depotDlc ?? {});
+    const stillIds = [...Object.values(still.byDlc).flat(), ...still.orphans];
+    logger.info(
+        `appid=${appid}: merged DLC app info [${dlcIds.join(",")}] for depot(s) [${Object.values(byDlc).flat().join(",")}]; ` +
+        (stillIds.length > 0 ? `still unresolved [${stillIds.join(",")}]` : "all installed depots resolved"),
+    );
+    return merged;
 }
 
 /**

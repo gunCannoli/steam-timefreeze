@@ -1,7 +1,7 @@
 --- steam-timefreeze backend entry point.
 
 local millennium = require("millennium")
-local logger = require("logger")
+local logger = require("log").logger
 local platform = require("platform")
 local log = require("log")
 local timefreeze = require("timefreeze")
@@ -14,6 +14,7 @@ TimefreezeSyncFrozen = RPC.TimefreezeSyncFrozen
 TimefreezeListFrozen = RPC.TimefreezeListFrozen
 TimefreezeAddCustomVersion = RPC.TimefreezeAddCustomVersion
 TimefreezePurgeCache = RPC.TimefreezePurgeCache
+TimefreezeDiagnose = RPC.TimefreezeDiagnose
 TimefreezeLog = RPC.TimefreezeLog
 
 local function on_load()

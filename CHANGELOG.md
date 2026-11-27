@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.1.7-beta] - 2026-11-27
+
+### Added
+
+- **Update diagnostics in `timefreeze.log`**: for every frozen game at startup, on opening its Timefreeze tab (also any game Steam wants to update), and after each freeze, a `[diag]` block logs the manifest's update fields (`StateFlags`, `TargetBuildID`, `BytesToDownload`, `UpdateResult`, read-only, leftover caches), one line per installed depot (file / spoofed / real / latest manifest and a verdict: `ok`, `STALE`, `UNRESOLVED`), and Steam's own reason from `<Steam>/logs/content_log.txt` (`state changed : Update Required`, `config changed : updated depots …`).
+- **Freeze guard**: frozen games are watched while Steam runs; when one turns to Update Required / Queued / Downloading it is logged (`[watch]`), paused, diagnosed and re-frozen (at most every 5 minutes; `[guard]`). This is the fallback for Linux, where a read-only manifest does not stop Steam from replacing it.
+- The log's first line names the plugin version; the home folder is written as `~`.
+
+### Fixed
+
+- **Games with DLC depots kept showing Update (Cyberpunk 2077)**: for games whose DLC depots live in the DLC's own app info (`hasdepotsindlc`, e.g. Phantom Liberty `2138330`), the latest DLC manifest was never found, so the spoofed manifest kept the old DLC depot and Steam kept asking for an update. Timefreeze now also reads each owning DLC's app info (console or Web API, branchless DLC info accepted) and spoofs every installed depot; a re-freeze with less information keeps the earlier spoof instead of restoring the old manifest. Depots it still cannot resolve are named in the tab and in the log.
+- **`timefreeze.log` held only its start-up lines**: backend modules kept Millennium's logger captured before the file logger was installed, so no freeze, sync, error or frontend line was ever written (0.1.5 and 0.1.6). Every module now logs through the file logger.
+
 ## [0.1.6-beta] - 2026-11-24
 
 ### Fixed

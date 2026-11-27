@@ -8,6 +8,13 @@
 
 local platform = require("platform")
 
+-- Millennium's own logger, captured when this module loads. Every backend module logs through
+-- `M.logger` (below), never through a `require("logger")` of its own: a module that captured
+-- `logger` at load time kept Millennium's original after `install()` swapped package.loaded,
+-- so up to 0.1.6 nothing but the init lines ever reached timefreeze.log.
+local ok_orig, original_logger = pcall(require, "logger")
+if not ok_orig or type(original_logger) ~= "table" then original_logger = nil end
+
 local M = {}
 
 M.MAX_BYTES = 1024 * 1024 -- 1 MiB cap per log file, rotates to .1
@@ -108,9 +115,27 @@ local function write_raw(line)
   end
 end
 
---- Redact passwords, tokens, userids (guardrail 7).
+local function escape_pattern(p)
+  return (p:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
+local home_pattern = nil
+local function home_prefix_pattern()
+  if home_pattern ~= nil then return home_pattern end
+  local ok, h = pcall(platform.home)
+  if ok and type(h) == "string" and #h > 3 then
+    home_pattern = escape_pattern(h)
+  else
+    home_pattern = false
+  end
+  return home_pattern
+end
+
+--- Redact passwords, tokens, userids and the home folder (guardrail 7: no user names in logs).
 function M.redact(str)
   local s = tostring(str or "")
+  local hp = home_prefix_pattern()
+  if hp then s = s:gsub(hp, "~") end
   s = s:gsub("[%w%._%%%+%-]+@[%w%.%-]+%.%a%a+", "<email>")
   s = s:gsub("([Uu][Ss][Ee][Rr][Dd][Aa][Tt][Aa][\\/])%d+", "%1<id>")
   s = s:gsub("([Uu][Ss][Ee][Rr][%s_]*[Ii]?[Dd]?[%s:=]*)(%d%d%d%d%d+)", "%1<id>")
@@ -146,36 +171,39 @@ function M.debug(msg, extra)
   M.write("DEBUG", msg, extra)
 end
 
---- Install the tee over package.loaded["logger"].
+local function tee_method(name, writer)
+  return function(_, msg)
+    if original_logger and original_logger[name] then pcall(original_logger[name], original_logger, msg) end
+    -- File writes start at install() (on_load), so offline tests never drop a log in the source tree.
+    if installed then writer(msg) end
+  end
+end
+
+--- The logger every backend module uses: Millennium's console log plus timefreeze.log.
+M.logger = {
+  info = tee_method("info", function(m) M.info(m) end),
+  warn = tee_method("warn", function(m) M.warn(m) end),
+  error = tee_method("error", function(m) M.error(m) end),
+  debug = tee_method("debug", function(m) M.debug(m) end),
+}
+
+--- Plugin version from plugin.json, so every report names the build it came from.
+function M.plugin_version()
+  local root = M.resolve_plugin_root()
+  local f = root and io.open(platform.join(root, "plugin.json"), "rb")
+  if not f then return "unknown" end
+  local raw = f:read("*a") or ""
+  f:close()
+  return raw:match('"version"%s*:%s*"([^"]+)"') or "unknown"
+end
+
+--- Start writing to disk and route any later `require("logger")` through the tee.
 function M.install()
   if installed then return end
   installed = true
+  package.loaded["logger"] = M.logger
 
-  local ok, orig = pcall(require, "logger")
-  local original = ok and orig or nil
-
-  local tee = {
-    info = function(self, msg)
-      if original and original.info then pcall(original.info, original, msg) end
-      M.info(msg)
-    end,
-    warn = function(self, msg)
-      if original and original.warn then pcall(original.warn, original, msg) end
-      M.warn(msg)
-    end,
-    error = function(self, msg)
-      if original and original.error then pcall(original.error, original, msg) end
-      M.error(msg)
-    end,
-    debug = function(self, msg)
-      if original and original.debug then pcall(original.debug, original, msg) end
-      M.debug(msg)
-    end,
-  }
-
-  package.loaded["logger"] = tee
-
-  M.info("=== steam-timefreeze logger initialized ===")
+  M.info("=== steam-timefreeze " .. M.plugin_version() .. " logger initialized ===")
   local host = platform.host_info()
   M.info(string.format("[host] os=%s distro=%s deck=%s flatpak=%s", tostring(host.os), tostring(host.distro), tostring(host.deck), tostring(host.flatpak)))
   M.info(string.format("OS=%s, SteamPath=%s, PluginRoot=%s", platform.os_name(), get_steam_path(), tostring(M.resolve_plugin_root())))
@@ -188,6 +216,7 @@ end
 function M._reset()
   installed = false
   file_paths = nil
+  home_pattern = nil
 end
 
 return M

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { DialogButton, Dropdown, Field, PanelSection, Spinner, TextField } from "@steambrew/client";
 import { backend, type GameFreezeStatus } from "../ports/backend";
-import { fetchSteamAppInfo, runDownloadDepot, type ParsedAppInfo } from "../steam/app-info";
+import { fetchAppInfoForInstall, runDownloadDepot, type ParsedAppInfo } from "../steam/app-info";
+import { DISPLAY_STATUS_UPDATE_REQUIRED, displayStatusName, isUpdateState, liveDisplayStatus } from "../steam/display-status";
 import { buildVersionOptions, formatUnixDate, resolveLatestTarget, type VersionOption } from "../domain/versions";
 import { logger } from "../logger";
 
@@ -25,21 +26,13 @@ interface SteamClientPartial {
     };
 }
 
-interface AppOverviewPartial {
-    local_per_client_data?: {
-        display_status?: number;
-    };
-}
-
 function steamClient(): SteamClientPartial | undefined {
     return (globalThis as unknown as { SteamClient?: SteamClientPartial }).SteamClient;
 }
 
-function liveDisplayStatus(appid: number): number | undefined {
-    const store = (globalThis as unknown as {
-        appStore?: { GetAppOverviewByAppID?: (id: number) => AppOverviewPartial | undefined };
-    }).appStore;
-    return store?.GetAppOverviewByAppID?.(appid)?.local_per_client_data?.display_status;
+/** Installed depots the freeze cannot spoof (no latest manifest found in the game's or its DLCs' app info). */
+function unresolvedDepots(st: GameFreezeStatus, latestDepots: Record<string, string>): string[] {
+    return Object.keys(st.installedDepots ?? {}).filter((d) => !latestDepots[d]);
 }
 
 const BLOCK_GAP = 22;
@@ -77,16 +70,24 @@ export function TimefreezePage({ appid }: { appid: number }) {
         setLoading(true);
         setError("");
         try {
-            const [st, info] = await Promise.all([
-                backend.getStatus(appid),
-                fetchSteamAppInfo(appid),
-            ]);
+            const st = await backend.getStatus(appid);
+            const info = await fetchAppInfoForInstall(appid, st.installedDepots, st.installedDepotDlc);
             if (st.error) {
                 setError(st.error);
             }
             setStatus(st);
             setAppInfo(info);
-            setDisplayStatus(liveDisplayStatus(appid));
+            const ds = liveDisplayStatus(appid);
+            setDisplayStatus(ds);
+            // Any frozen game, or any game Steam wants to update: the full [diag] block goes to timefreeze.log.
+            if (st.found && (st.frozen || isUpdateState(ds))) {
+                const target = resolveLatestTarget(st, info);
+                void backend.diagnose(appid, `tab-open-${displayStatusName(ds)}`, {
+                    displayStatus: ds,
+                    latestBuildId: target.latestBuildId,
+                    latestDepots: target.latestDepots,
+                });
+            }
             const firstDepot = Object.keys(st.installedDepots ?? {})[0];
             if (firstDepot) setDepotInput((prev) => prev || firstDepot);
         } catch (err) {
@@ -147,17 +148,22 @@ export function TimefreezePage({ appid }: { appid: number }) {
             const res = await backend.freeze(appid, latestBuildId, latestDepots);
             const afterDisplay = liveDisplayStatus(appid);
             setDisplayStatus(afterDisplay);
-            logger.info(`freeze UI appid=${appid} displayStatus=${beforeDisplay}->${afterDisplay} target=${latestBuildId} depotCount=${Object.keys(latestDepots).length}`);
+            const missing = unresolvedDepots(status, latestDepots);
+            logger.info(`freeze UI appid=${appid} displayStatus=${displayStatusName(beforeDisplay)}->${displayStatusName(afterDisplay)} target=${latestBuildId} depotCount=${Object.keys(latestDepots).length} unresolved=[${missing.join(",")}]`);
+            void backend.diagnose(appid, "after-freeze", { displayStatus: afterDisplay, latestBuildId, latestDepots });
             if (res.error) {
                 setError(res.error);
                 setMessage("");
             } else {
                 setStatus(res);
-                const needsRestart = afterDisplay === 20;
+                const needsRestart = afterDisplay === DISPLAY_STATUS_UPDATE_REQUIRED;
+                const base = needsRestart
+                    ? `Frozen at Build ${res.installedBuildId}. Steam already cached this update in memory — click Restart Steam to switch the button to Play.`
+                    : `Frozen at Build ${res.installedBuildId}. Steam will not update this game.`;
                 setMessage(
-                    needsRestart
-                        ? `Frozen at Build ${res.installedBuildId}. Steam already cached this update in memory — click Restart Steam to switch the button to Play.`
-                        : `Frozen at Build ${res.installedBuildId}. Steam will not update this game.`,
+                    missing.length > 0
+                        ? `${base} Warning: no latest manifest found for ${missing.length} depot(s) (${missing.join(", ")}); Steam may keep showing Update. Send timefreeze.log.`
+                        : base,
                 );
             }
         } catch (err) {
@@ -371,7 +377,7 @@ export function TimefreezePage({ appid }: { appid: number }) {
         );
     }
 
-    const steamStillShowsUpdate = status.frozen && displayStatus === 20;
+    const steamStillShowsUpdate = status.frozen && displayStatus === DISPLAY_STATUS_UPDATE_REQUIRED;
     const updatePending =
         !status.frozen &&
         Boolean(latestBuildId) &&
